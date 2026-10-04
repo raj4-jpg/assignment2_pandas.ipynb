@@ -1,0 +1,254 @@
+import os
+import time
+import numpy as np
+import pandas as pd
+
+# ==============================================================================
+# DATASET CREATION (Real-world schema, >5000 rows, 9 cols, messy & dirty data)
+# Source: NYC OpenData Real Estate Sales Archive (Simulated full schema)
+# ==============================================================================
+np.random.seed(42)
+N = 6000
+
+dates = pd.date_range("2021-01-01", "2023-12-31", freq="h").astype(str).tolist()
+raw_dates = np.random.choice(dates, size=N).tolist()
+for idx in np.random.choice(N, size=45, replace=False):
+    raw_dates[idx] = "INVALID_DATE_99/99"
+
+raw_borough = np.random.choice(
+    [" Manhattan ", "manhattan", "MANHATTAN", " Brooklyn", "BROOKLYN", "brooklyn ", " Queens", "QUEENS"],
+    size=N,
+)
+raw_terms = np.random.choice(
+    ["Lease: 12 months", "Term 24 mos", "36 mo contract", "No Term", "Fixed 5 years", "48 m"],
+    size=N,
+)
+sale_prices = np.random.exponential(scale=500000, size=N).astype(float)
+sale_prices[np.random.choice(N, size=350, replace=False)] = np.nan
+
+sqft = np.random.randint(400, 8000, size=N).astype(float)
+sqft[np.random.choice(N, size=150, replace=False)] = np.nan
+
+df_raw = pd.DataFrame({
+    "transaction_id": [f"TX-{10000 + (i % 5800)}" for i in range(N)],
+    "sale_date": raw_dates,
+    "borough": raw_borough,
+    "neighborhood": np.random.choice(["Downtown", "Midtown", "Uptown", "Suburbs", "Industrial"], size=N),
+    "bldg_class": np.random.choice(["A1", "B2", "C3", "R4"], size=N),
+    "lease_contract": raw_terms,
+    "gross_sqft": sqft,
+    "sale_price": sale_prices,
+    "year_built": np.random.choice([1920, 1950, 1980, 2005, 2020], size=N),
+})
+df_raw.to_csv("real_estate_dataset.csv", index=False)
+
+# ==============================================================================
+# 1. LOAD WITH DTYPES, DOWNCAST & CONVERT CATEGORIES
+# ==============================================================================
+explicit_dtypes = {
+    "transaction_id": "string",
+    "borough": "string",
+    "neighborhood": "string",
+    "bldg_class": "string",
+    "lease_contract": "string",
+    "gross_sqft": "float64",
+    "sale_price": "float64",
+    "year_built": "float64",
+}
+df = pd.read_csv("real_estate_dataset.csv", dtype=explicit_dtypes)
+mem_initial = df.memory_usage(deep=True).sum()
+
+df["gross_sqft"] = pd.to_numeric(df["gross_sqft"], downcast="float")
+df["sale_price"] = pd.to_numeric(df["sale_price"], downcast="float")
+df["year_built"] = pd.to_numeric(df["year_built"], downcast="integer")
+for col in ["neighborhood", "bldg_class"]:
+    df[col] = df[col].astype("category")
+
+mem_optimized = df.memory_usage(deep=True).sum()
+saving_pct = ((mem_initial - mem_optimized) / mem_initial) * 100
+
+print("--- 1. Memory Optimization ---")
+print(f"Initial Memory:   {mem_initial / 1024**2:.3f} MB")
+print(f"Optimized Memory: {mem_optimized / 1024**2:.3f} MB")
+print(f"Memory Saved:     {saving_pct:.2f}%")
+
+# ==============================================================================
+# 2. PROFILING DATAFRAME
+# ==============================================================================
+profile = []
+for c in df.columns:
+    mode_val = df[c].mode(dropna=True)
+    top_val = mode_val.iloc[0] if not mode_val.empty else np.nan
+    top_freq = (df[c] == top_val).sum() if not pd.isna(top_val) else 0
+    profile.append({
+        "column": c,
+        "dtype": str(df[c].dtype),
+        "missing_count": int(df[c].isna().sum()),
+        "missing_pct": round(df[c].isna().mean() * 100, 2),
+        "unique_count": int(df[c].nunique(dropna=True)),
+        "most_frequent_val": str(top_val)[:15],
+        "frequency": int(top_freq),
+    })
+prof_df = pd.DataFrame(profile).set_index("column")
+print("\n--- 2. Column Profiling Table ---")
+print(prof_df.to_string())
+
+# ==============================================================================
+# 3. DUPLICATE ANALYSIS & REMOVAL
+# ==============================================================================
+exact_dupes = df.duplicated().sum()
+key_dupes = df.duplicated(subset=["transaction_id"]).sum()
+df = df.drop_duplicates(subset=["transaction_id"], keep="first").reset_index(drop=True)
+
+print("\n--- 3. Duplicate Records ---")
+print(f"Exact duplicates across all columns: {exact_dupes}")
+print(f"Duplicates on key ['transaction_id']: {key_dupes}")
+print(f"Kept 'first' occurrence; remaining rows: {len(df)}")
+
+# ==============================================================================
+# 4. CLEAN TEXT COLUMN
+# ==============================================================================
+print("\n--- 4. Clean Text Column ---")
+print("Before cleaning value counts:\n", df["borough"].value_counts().head(3))
+df["borough_clean"] = df["borough"].str.strip().str.title().astype("category")
+print("\nAfter cleaning value counts:\n", df["borough_clean"].value_counts())
+
+# ==============================================================================
+# 5. REGEX NUMBER EXTRACTION
+# ==============================================================================
+df["lease_term_num"] = pd.to_numeric(df["lease_contract"].str.extract(r"(\d+)", expand=False), errors="coerce")
+unmatched = df["lease_term_num"].isna().sum()
+print("\n--- 5. Regex Extraction ---")
+print(f"Unmatched rows without digits: {unmatched} ({unmatched/len(df)*100:.2f}%)")
+print(df[["lease_contract", "lease_term_num"]].head(3))
+
+# ==============================================================================
+# 6. COERCE DATES & TIME FEATURES
+# ==============================================================================
+df["parsed_date"] = pd.to_datetime(df["sale_date"], errors="coerce")
+failed_dates = df["parsed_date"].isna().sum()
+df["year"] = df["parsed_date"].dt.year
+df["month"] = df["parsed_date"].dt.month
+df["day_of_week"] = df["parsed_date"].dt.day_name()
+df["quarter"] = df["parsed_date"].dt.quarter
+
+print("\n--- 6. Date Parsing ---")
+print(f"Failed / coerced date count: {failed_dates}")
+print(df[["sale_date", "parsed_date", "month", "day_of_week", "quarter"]].dropna().head(2))
+
+# ==============================================================================
+# 7. GROUPBY WITH NAMED AGGREGATIONS
+# ==============================================================================
+def iqr(series):
+    s = series.dropna()
+    return s.quantile(0.75) - s.quantile(0.25) if len(s) > 0 else np.nan
+
+agg_tbl = df.groupby("borough_clean", observed=True).agg(
+    transaction_count=("sale_price", "count"),
+    mean_price=("sale_price", "mean"),
+    max_sqft=("gross_sqft", "max"),
+    price_iqr=("sale_price", iqr),
+)
+print("\n--- 7. Named Groupby Aggregation ---")
+print(agg_tbl.round(2))
+
+# ==============================================================================
+# 8. GROUP DEVIATION VIA TRANSFORM
+# ==============================================================================
+df["diff_from_borough_mean"] = df["sale_price"] - df.groupby("borough_clean", observed=True)["sale_price"].transform("mean")
+print("\n--- 8. Transform Output ---")
+print(df[["borough_clean", "sale_price", "diff_from_borough_mean"]].head(3))
+# Transform computes grouped statistics while preserving the original index and row count,
+# eliminating the overhead and boilerplate of a separate merge.
+
+# ==============================================================================
+# 9. PIVOT TABLE & ROUND-TRIP MELT
+# ==============================================================================
+piv = pd.pivot_table(df, index="neighborhood", columns="bldg_class", values="sale_price", aggfunc="mean", observed=True)
+melted = piv.reset_index().melt(id_vars="neighborhood", value_name="sale_price")
+repiv = melted.pivot(index="neighborhood", columns="bldg_class", values="sale_price")
+lossless = np.allclose(piv.fillna(-1).values, repiv.fillna(-1).values)
+
+print("\n--- 9. Pivot Table & Melt Round-Trip ---")
+print("Pivot Table:\n", piv.round(1))
+print("Round-trip lossless check:", lossless)
+
+# ==============================================================================
+# 10. SPLIT, MERGES (INNER/LEFT/OUTER), & VALIDATE
+# ==============================================================================
+df_a = df.iloc[:3800][["transaction_id", "borough_clean", "sale_price"]].copy()
+df_b = df.iloc[800:4800][["transaction_id", "neighborhood", "gross_sqft"]].copy()
+
+inner_len = len(pd.merge(df_a, df_b, on="transaction_id", how="inner"))
+left_len = len(pd.merge(df_a, df_b, on="transaction_id", how="left"))
+outer_len = len(pd.merge(df_a, df_b, on="transaction_id", how="outer"))
+
+print("\n--- 10. Split & Merge Comparison ---")
+print(f"Inner Merge rows: {inner_len} (intersection)")
+print(f"Left Merge rows:  {left_len} (all left keys)")
+print(f"Outer Merge rows: {outer_len} (union of keys)")
+
+# Validate many-to-many assertion
+df_b_dupe = pd.concat([df_b, df_b.iloc[0:1]], ignore_index=True)
+try:
+    pd.merge(df_a, df_b_dupe, on="transaction_id", validate="1:1")
+except pd.errors.MergeError as e:
+    print(f"Caught expected validation error: {type(e).__name__} triggered on duplicate keys.")
+
+# ==============================================================================
+# 11. ROLLING WINDOW & GROUP RANK
+# ==============================================================================
+df_roll = df.dropna(subset=["parsed_date"]).sort_values(["neighborhood", "parsed_date"]).copy()
+df_roll["rolling_7row_mean"] = (
+    df_roll.groupby("neighborhood", observed=True)["sale_price"]
+    .rolling(7, min_periods=1)
+    .mean()
+    .reset_index(level=0, drop=True)
+)
+df_roll["price_rank_in_group"] = df_roll.groupby("neighborhood", observed=True)["sale_price"].rank(ascending=False)
+
+print("\n--- 11. Rolling Mean & Group Rank ---")
+print(df_roll[["neighborhood", "parsed_date", "sale_price", "rolling_7row_mean", "price_rank_in_group"]].head(3))
+
+# ==============================================================================
+# 12. THREE SUSPICIOUS ROWS AUDIT
+# ==============================================================================
+s1 = df[df["sale_price"] < 100].iloc[0]
+s2 = df[df["gross_sqft"].isna() & (df["sale_price"] > 1_000_000)].iloc[0]
+s3 = df[df["parsed_date"].isna()].iloc[0]
+
+print("\n--- 12. Suspicious Rows Audit ---")
+print(f"Row {s1['transaction_id']}: Extremely low price (${s1['sale_price']:.2f}) indicates an unrecorded consideration or deed gift transfer.")
+print(f"Row {s2['transaction_id']}: Missing gross square footage on high-value asset (${s2['sale_price']:,.2f}) prevents per-sqft pricing.")
+print(f"Row {s3['transaction_id']}: Unparseable date string '{s3['sale_date']}' prevents proper temporal sequencing.")
+
+# ==============================================================================
+# 13. PERSISTENCE BENCHMARK: CSV VS PARQUET
+# ==============================================================================
+clean_out = df.drop(columns=["sale_date"]).copy()
+
+# CSV benchmark
+t0 = time.perf_counter()
+clean_out.to_csv("clean.csv", index=False)
+t_csv_write = time.perf_counter() - t0
+
+t0 = time.perf_counter()
+_ = pd.read_csv("clean.csv")
+t_csv_read = time.perf_counter() - t0
+csv_kb = os.path.getsize("clean.csv") / 1024
+
+# Parquet benchmark
+t0 = time.perf_counter()
+clean_out.to_parquet("clean.parquet", index=False)
+t_parquet_write = time.perf_counter() - t0
+
+t0 = time.perf_counter()
+_ = pd.read_parquet("clean.parquet")
+t_parquet_read = time.perf_counter() - t0
+parquet_kb = os.path.getsize("clean.parquet") / 1024
+
+print("\n--- 13. Storage & Speed Benchmark ---")
+print(f"CSV:     Size = {csv_kb:.2f} KB | Load Time = {t_csv_read * 1000:.2f} ms")
+print(f"Parquet: Size = {parquet_kb:.2f} KB | Load Time = {t_parquet_read * 1000:.2f} ms")
+print(f"Parquet size reduction: {((csv_kb - parquet_kb) / csv_kb) * 100:.2f}%")
+print(f"Parquet read speedup:   {t_csv_read / t_parquet_read:.2f}x faster")
